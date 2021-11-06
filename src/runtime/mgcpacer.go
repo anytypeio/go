@@ -84,12 +84,9 @@ func init() {
 var gcController gcControllerState
 
 type gcControllerState struct {
-	// Initialized from $GOGC. GOGC=off means no GC.
-	//
-	// Updated atomically with mheap_.lock held or during a STW.
-	// Safe to read atomically at any time, or non-atomically with
-	// mheap_.lock or STW.
-	gcPercent int32
+
+	// Initialized from GOGC. GOGC=off means no GC.
+	gcPercent atomic.Int32
 
 	_ uint32 // padding so following 64-bit values are 8-byte aligned
 
@@ -349,9 +346,6 @@ func (c *gcControllerState) init(gcPercent int32) {
 			kp: 0.9,
 			ti: 4.0,
 
-			// An update is done once per GC cycle.
-			period: 1,
-
 			// Set a high reset time in GC cycles.
 			// This is inversely proportional to the rate at which we
 			// accumulate error from clipping. By making this very high
@@ -482,7 +476,7 @@ func (c *gcControllerState) startCycle(markStartTime int64, procs int) {
 // is when assists are enabled and the necessary statistics are
 // available).
 func (c *gcControllerState) revise() {
-	gcPercent := atomic.Loadint32(&c.gcPercent)
+	gcPercent := c.gcPercent.Load()
 	if gcPercent < 0 {
 		// If GC is disabled but we're running a forced GC,
 		// act like GOGC is huge for the below calculations.
@@ -677,8 +671,9 @@ func (c *gcControllerState) endCycle(now int64, procs int, userForced bool) floa
 			(float64(scanWork) * (1 - utilization))
 
 		// Update cons/mark controller.
+		// Period for this is 1 GC cycle.
 		oldConsMark := c.consMark
-		c.consMark = c.consMarkController.next(c.consMark, currentConsMark)
+		c.consMark = c.consMarkController.next(c.consMark, currentConsMark, 1.0)
 
 		if debug.gcpacertrace > 0 {
 			printlock()
@@ -971,8 +966,8 @@ func (c *gcControllerState) commit(triggerRatio float64) {
 	// has grown by GOGC/100 over where it started the last cycle,
 	// plus additional runway for non-heap sources of GC work.
 	goal := ^uint64(0)
-	if c.gcPercent >= 0 {
-		goal = c.heapMarked + (c.heapMarked+atomic.Load64(&c.stackScan)+atomic.Load64(&c.globalsScan))*uint64(c.gcPercent)/100
+	if gcPercent := c.gcPercent.Load(); gcPercent >= 0 {
+		goal = c.heapMarked + (c.heapMarked+atomic.Load64(&c.stackScan)+atomic.Load64(&c.globalsScan))*uint64(gcPercent)/100
 	}
 
 	// Don't trigger below the minimum heap size.
@@ -1086,17 +1081,19 @@ func (c *gcControllerState) commit(triggerRatio float64) {
 //
 // For !goexperiment.PacerRedesign.
 func (c *gcControllerState) oldCommit(triggerRatio float64) {
+	gcPercent := c.gcPercent.Load()
+
 	// Compute the next GC goal, which is when the allocated heap
 	// has grown by GOGC/100 over the heap marked by the last
 	// cycle.
 	goal := ^uint64(0)
-	if c.gcPercent >= 0 {
-		goal = c.heapMarked + c.heapMarked*uint64(c.gcPercent)/100
+	if gcPercent >= 0 {
+		goal = c.heapMarked + c.heapMarked*uint64(gcPercent)/100
 	}
 
 	// Set the trigger ratio, capped to reasonable bounds.
-	if c.gcPercent >= 0 {
-		scalingFactor := float64(c.gcPercent) / 100
+	if gcPercent >= 0 {
+		scalingFactor := float64(gcPercent) / 100
 		// Ensure there's always a little margin so that the
 		// mutator assist ratio isn't infinity.
 		maxTriggerRatio := 0.95 * scalingFactor
@@ -1136,7 +1133,7 @@ func (c *gcControllerState) oldCommit(triggerRatio float64) {
 	// We trigger the next GC cycle when the allocated heap has
 	// grown by the trigger ratio over the marked heap size.
 	trigger := ^uint64(0)
-	if c.gcPercent >= 0 {
+	if gcPercent >= 0 {
 		trigger = uint64(float64(c.heapMarked) * (1 + triggerRatio))
 		// Don't trigger below the minimum heap size.
 		minTrigger := c.heapMinimum
@@ -1212,13 +1209,12 @@ func (c *gcControllerState) setGCPercent(in int32) int32 {
 		assertWorldStoppedOrLockHeld(&mheap_.lock)
 	}
 
-	out := c.gcPercent
+	out := c.gcPercent.Load()
 	if in < 0 {
 		in = -1
 	}
-	// Write it atomically so readers like revise() can read it safely.
-	atomic.Storeint32(&c.gcPercent, in)
-	c.heapMinimum = defaultHeapMinimum * uint64(c.gcPercent) / 100
+	c.heapMinimum = defaultHeapMinimum * uint64(in) / 100
+	c.gcPercent.Store(in)
 	// Update pacing in response to gcPercent change.
 	c.commit(c.triggerRatio)
 
@@ -1259,10 +1255,7 @@ func readGOGC() int32 {
 type piController struct {
 	kp float64 // Proportional constant.
 	ti float64 // Integral time constant.
-	tt float64 // Reset time in GC cyles.
-
-	// Period in GC cycles between updates.
-	period float64
+	tt float64 // Reset time.
 
 	min, max float64 // Output boundaries.
 
@@ -1271,7 +1264,7 @@ type piController struct {
 	errIntegral float64 // Integral of the error from t=0 to now.
 }
 
-func (c *piController) next(input, setpoint float64) float64 {
+func (c *piController) next(input, setpoint, period float64) float64 {
 	// Compute the raw output value.
 	prop := c.kp * (setpoint - input)
 	rawOutput := prop + c.errIntegral
@@ -1286,7 +1279,7 @@ func (c *piController) next(input, setpoint float64) float64 {
 
 	// Update the controller's state.
 	if c.ti != 0 && c.tt != 0 {
-		c.errIntegral += (c.kp*c.period/c.ti)*(setpoint-input) + (c.period/c.tt)*(output-rawOutput)
+		c.errIntegral += (c.kp*period/c.ti)*(setpoint-input) + (period/c.tt)*(output-rawOutput)
 	}
 	return output
 }

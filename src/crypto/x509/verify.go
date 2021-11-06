@@ -753,8 +753,8 @@ func (c *Certificate) Verify(opts VerifyOptions) (chains [][]*Certificate, err e
 		}
 	}
 
-	// Use Windows's own verification and chain building.
-	if opts.Roots == nil && runtime.GOOS == "windows" {
+	// Use platform verifiers, where available
+	if opts.Roots == nil && (runtime.GOOS == "windows" || runtime.GOOS == "darwin" || runtime.GOOS == "ios") {
 		return c.systemVerify(&opts)
 	}
 
